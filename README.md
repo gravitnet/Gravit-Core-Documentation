@@ -39,8 +39,8 @@ The ecosystem is organized along three axes of existence:
 
 ### 3. Gravit Quantum (Z-Axis) | *The Space of Legacy*
 *   **Role**: Fixation & Optimization.
-*   **Function**: An AI-first infrastructure layer that makes trust, logic, and accountability native components. It utilizes **Gravit QRTV (Quantum Real Time Verification)** to continuously check and seal state transitions using **Post-Quantum Cryptography** (Kyber, Dilithium).
-*   **Key Concept**: "The Seal of the Century — where temporary actions become eternal legacy."
+*   **Function**: An AI-first infrastructure layer that makes trust, logic, and accountability native components. It utilizes **Gravit QRTV (Quantum Real Time Verification)** to continuously check and seal state transitions using **Post Quantum Cryptography** (Kyber, Dilithium).
+*   **Key Concept**: "The Seal of the Century where temporary actions become eternal legacy."
 
 ---
 
@@ -76,7 +76,7 @@ Gravit operates on a coherent **L1-L2-L3** stack designed for "Meaningful Action
 
 ### Key Technologies
 *   **Trust Engine**: A mathematical model that propagates trust across the graph using weighted vectors (Provenance, Semantic Consistency, Reputation). It uses an iterative algorithm (similar to PageRank) to compute dynamic trust scores.
-*   **Simulation Framework**: A Python-based engine used to stress-test the network against specific attack vectors like Sybil Injection and Contradiction Flooding.
+*   **Simulation Framework**: A Python-based engine used to stress test the network against specific attack vectors like Sybil Injection and Contradiction Flooding.
 *   **Data Models**: Structured definitions for "Semantic Units" (L2) and "Quantum States" (L3) that allow AI agents to communicate intent unambiguously.
 
 ---
@@ -111,6 +111,7 @@ This repository contains the full conceptual documentation and the initial Pytho
 *   `08_data_models/`: Structural data models for L1 (Open Network), L2 (Continuum), and L3 (Quantum).
 *   `09_trust_engine/`: Mathematical trust models and Python MVP implementation.
 *   `10_simulation/`: Simulation framework, attack scenarios, and reporting templates.
+
 
 
 
