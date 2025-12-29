@@ -2,18 +2,18 @@
 
 **The Ontological Foundation for Verifiable AI**
 
-Gravit Open Network is an emerging decentralized infrastructure platform designed to bridge the gap between AI development and verifiable, provable logic. As of late 2025, the network positions itself not as a standard technological upgrade, but as an ontological shift—redefining the nature of how AI interacts with reality, meaningful action, and trust.
+Gravit Open Network is an emerging decentralized infrastructure platform designed to bridge the gap between AI development and verifiable, provable logic. As of late 2025, the network positions itself not as a standard technological upgrade, but as an ontological shiftredefining the nature of how AI interacts with reality, meaningful action, and trust.
 
 ---
 
 ## The Vision: Why Gravit?
 
 ### The Problem: The "Black Box" of Trust
-Modern AI systems operate as black boxes. They generate outputs with incredible speed but often lack verifiable intent, consistent logic, or an auditable trail of "meaning." In high-stakes sectors—legal, healthcare, infrastructure, and finance—this lack of provability is a critical barrier to adoption.
+Modern AI systems operate as black boxes. They generate outputs with incredible speed but often lack verifiable intent, consistent logic, or an auditable trail of "meaning." In high stakes sectors legal, healthcare, infrastructure, and finance this lack of provability is a critical barrier to adoption.
 
 ### The Solution: Verifiable Intelligence
 Gravit creates an ecosystem where **Trust is not assumed; it is computed.**
-By integrating a multi-layer architecture (L1-L2-L3), Gravit ensures that every AI action is:
+By integrating a multi layer architecture (L1-L2-L3), Gravit ensures that every AI action is:
 1.  **Traceable** (via the Open Network).
 2.  **Semantically Verified** (via the Continuum).
 3.  **Optimized & Fixed** (via the Quantum Platform).
@@ -111,5 +111,6 @@ This repository contains the full conceptual documentation and the initial Pytho
 *   `08_data_models/`: Structural data models for L1 (Open Network), L2 (Continuum), and L3 (Quantum).
 *   `09_trust_engine/`: Mathematical trust models and Python MVP implementation.
 *   `10_simulation/`: Simulation framework, attack scenarios, and reporting templates.
+
 
 
