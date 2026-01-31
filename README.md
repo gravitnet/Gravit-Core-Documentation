@@ -29,4 +29,5 @@ Detailed specifications, references, and implementations
 will be published progressively.
 
 ## Links
-- Website: https://gravitnet.org
+
+- Website: [https://gravit.network](https://gravit.network/)
