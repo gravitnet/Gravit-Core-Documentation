@@ -1,0 +1,62 @@
+[
+  {
+    "id": "baseline_small",
+    "description": "Baseline run on powerlaw graph (50 nodes), no attacks — контрольная точка.",
+    "type": "baseline_run",
+    "params": {}
+  },
+  {
+    "id": "sybil_small",
+    "description": "Small Sybil injection: 10 sybils attacking node N0.",
+    "type": "sybil_injection",
+    "params": {"n_sybil": 10, "connect_to": "N0", "seed": 101}
+  },
+  {
+    "id": "sybil_medium",
+    "description": "Medium Sybil injection: 30 sybils attacking node N0. Tests resilience to larger sybil groups.",
+    "type": "sybil_injection",
+    "params": {"n_sybil": 30, "connect_to": "N0", "seed": 102}
+  },
+  {
+    "id": "sybil_large",
+    "description": "Large Sybil injection: 80 sybils attacking central hub node N0 — stress test.",
+    "type": "sybil_injection",
+    "params": {"n_sybil": 80, "connect_to": "N0", "seed": 103}
+  },
+  {
+    "id": "contradiction_small",
+    "description": "Contradiction flood: 5 attackers submit contradicting evidence against target N1.",
+    "type": "contradiction_flood",
+    "params": {"target": "N1", "n_attackers": 5, "seed": 201}
+  },
+  {
+    "id": "contradiction_medium",
+    "description": "Contradiction flood: 15 attackers against N1 — tests semantic robustness.",
+    "type": "contradiction_flood",
+    "params": {"target": "N1", "n_attackers": 15, "seed": 202}
+  },
+  {
+    "id": "rapid_drop_local",
+    "description": "Rapid trust drop on a single node (N2) — simulates key compromise or provenance failure.",
+    "type": "rapid_trust_drop",
+    "params": {"target": "N2", "shock": 0.6}
+  },
+  {
+    "id": "cascade_combo",
+    "description": "Combined scenario: medium sybil + contradiction flood + rapid drop in sequence — tests cascades.",
+    "type": "sequence",
+    "params": {
+      "sequence": [
+        {"type":"sybil_injection","params":{"n_sybil":20,"connect_to":"N0","seed":301}},
+        {"type":"contradiction_flood","params":{"target":"N1","n_attackers":10,"seed":302}},
+        {"type":"rapid_trust_drop","params":{"target":"N2"}}
+      ]
+    }
+  },
+  {
+    "id": "parameter_sweep",
+    "description": "Sweep alpha (propagation damping) across [0.6,0.75,0.85,0.95] for baseline graph to measure sensitivity.",
+    "type": "sweep_alpha",
+    "params": {"alphas": [0.6, 0.75, 0.85, 0.95], "seed": 401}
+  }
+]

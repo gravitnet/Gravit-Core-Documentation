@@ -1,0 +1,74 @@
+[
+  {
+    "id": "baseline_small",
+    "type": "baseline_run",
+    "description": "Baseline propagation on powerlaw(50 nodes), no attacks.",
+    "params": {
+      "seed": 42,
+      "graph": {"type": "powerlaw", "num_nodes": 50, "m": 3},
+      "alpha": 0.85
+    }
+  },
+  {
+    "id": "sybil_small",
+    "type": "sybil_injection",
+    "description": "Sybil injection: 10 sybils attach to N0.",
+    "params": {
+      "seed": 101,
+      "graph": {"type": "powerlaw", "num_nodes": 50, "m": 3},
+      "alpha": 0.85,
+      "n_sybil": 10,
+      "connect_to": "N0"
+    }
+  },
+  {
+    "id": "sybil_medium",
+    "type": "sybil_injection",
+    "description": "Sybil injection: 30 sybils attach to N0.",
+    "params": {
+      "seed": 102,
+      "graph": {"type": "powerlaw", "num_nodes": 50, "m": 3},
+      "alpha": 0.85,
+      "n_sybil": 30,
+      "connect_to": "N0"
+    }
+  },
+  {
+    "id": "contradiction_small",
+    "type": "contradiction_flood",
+    "description": "Contradiction flood: 5 attackers contradict target N1 (negative sign edges).",
+    "params": {
+      "seed": 201,
+      "graph": {"type": "powerlaw", "num_nodes": 50, "m": 3},
+      "alpha": 0.85,
+      "target": "N1",
+      "n_attackers": 5
+    }
+  },
+  {
+    "id": "rapid_drop_local",
+    "type": "rapid_trust_drop",
+    "description": "Rapid trust drop on N2 (provenance failure).",
+    "params": {
+      "seed": 301,
+      "graph": {"type": "powerlaw", "num_nodes": 50, "m": 3},
+      "alpha": 0.85,
+      "target": "N2"
+    }
+  },
+  {
+    "id": "cascade_combo",
+    "type": "sequence",
+    "description": "Sequence: sybil(20->N0) then contradiction(10->N1) then rapid_drop(N2).",
+    "params": {
+      "seed": 777,
+      "graph": {"type": "powerlaw", "num_nodes": 50, "m": 3},
+      "alpha": 0.85,
+      "sequence": [
+        {"type": "sybil_injection", "params": {"n_sybil": 20, "connect_to": "N0"}},
+        {"type": "contradiction_flood", "params": {"target": "N1", "n_attackers": 10}},
+        {"type": "rapid_trust_drop", "params": {"target": "N2"}}
+      ]
+    }
+  }
+]

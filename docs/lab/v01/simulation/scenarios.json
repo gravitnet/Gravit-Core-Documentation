@@ -1,0 +1,5 @@
+[
+  {"id": "S1", "type": "Network Trust", "description": "Initial network trust propagation scenario."},
+  {"id": "S2", "type": "Consensus Test", "description": "Testing Gravit Consensus trust dynamics."},
+  {"id": "S3", "type": "Quantum Layer", "description": "Simulating Gravit Quantum Platform trust propagation."}
+]
