@@ -1,83 +1,125 @@
-# trust_core.py
-from typing import Dict, Any
-import math
-import time
-import uuid
+# propagation.py (v0.2 unified)
+"""
+Gravit Trust Lab — Propagation Engine v0.2
+Adds:
+  - node_out_weight: per-node multiplier for outgoing influence
+    * QUARANTINED nodes -> 0.0 (no influence)
+    * RECOVERING nodes -> e.g. 0.2 (partial influence)
+  - stable incoming index cache (rebuilt on edge changes)
 
-# Simple data classes as dict-like structures
-def now_ts() -> str:
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+Graph model:
+  out[src] = list of (dst, weight, semantic_sign)
+    - weight >= 0
+    - semantic_sign in [-1, 1] (support +1, contradict -1, partials allowed)
 
-# --- Linear trust aggregator ---
-def compute_trust_linear(p: float, s: float, r: float, m: float, decay: float, weights: Dict[str, float]) -> float:
+Propagation:
+  PageRank-like with semantic sign:
+    T_new[v] = alpha * sum_u ( (w_uv * s_uv / Z_u) * T[u] * node_out_weight[u] ) + (1-alpha) * B[v]
+
+Where:
+  - B[v] is bias (initial_trust)
+  - Z_u = sum over outgoing edges of u: w_u*
+    (optionally includes node_out_weight[u] as multiplier; we keep it separate in numerator)
+"""
+
+from __future__ import annotations
+
+from typing import Dict, List, Tuple, Optional, Any
+import collections
+
+
+class TrustGraph:
+    def __init__(self) -> None:
+        # out[src] -> list of (dst, weight, sign)
+        self.out: Dict[str, List[Tuple[str, float, float]]] = collections.defaultdict(list)
+        self._incoming_index: Optional[Dict[str, List[Tuple[str, float, float]]]] = None
+
+    def add_edge(self, src: str, dst: str, weight: float = 1.0, sign: float = 1.0) -> None:
+        self.out[src].append((dst, float(weight), float(sign)))
+        self._incoming_index = None  # invalidate
+
+    def get_outgoing(self, node: str) -> List[Tuple[str, float, float]]:
+        return self.out.get(node, [])
+
+    def _build_incoming_index(self) -> None:
+        inc: Dict[str, List[Tuple[str, float, float]]] = collections.defaultdict(list)
+        for u, outs in self.out.items():
+            for (v, w, s) in outs:
+                inc[v].append((u, float(w), float(s)))
+        self._incoming_index = inc
+
+    def get_incoming(self, node: str) -> List[Tuple[str, float, float]]:
+        if self._incoming_index is None:
+            self._build_incoming_index()
+        return self._incoming_index.get(node, [])
+
+    def nodes(self) -> List[str]:
+        nodes = set(self.out.keys())
+        for u, outs in self.out.items():
+            for (v, _, _) in outs:
+                nodes.add(v)
+        return sorted(nodes)
+
+
+def propagate_trust(
+    graph: TrustGraph,
+    initial_trust: Dict[str, float],
+    alpha: float = 0.85,
+    max_iter: int = 100,
+    eps: float = 1e-6,
+    node_out_weight: Optional[Dict[str, float]] = None,
+) -> Dict[str, float]:
     """
-    Simple interpretable linear aggregator.
-    p,s,r,m in [0,1], decay in (0,1], weights sum to 1.
+    PageRank-like propagation with semantic sign and per-node outgoing multipliers.
+
+    Args:
+      graph: TrustGraph
+      initial_trust: dict node->bias in [0,1] (also used as starting T)
+      alpha: damping
+      max_iter: iterations cap
+      eps: convergence L1 threshold
+      node_out_weight: dict node->multiplier [0,1] (or >1 if you want), default 1.0
+        Example: QUARANTINED => 0.0, RECOVERING => 0.2
     """
-    base = weights['p']*p + weights['s']*s + weights['r']*r + weights['m']*m
-    return max(0.0, min(1.0, decay * base))
+    if node_out_weight is None:
+        node_out_weight = {}
 
+    # Union of known nodes
+    nodes = set(initial_trust.keys()) | set(graph.nodes())
 
-# --- Provenance computation (stub / example) ---
-def compute_provenance(evidence: Dict[str, Any]) -> float:
-    """
-    Example provenance computation based on presence/validity of signatures and merkle.
-    evidence may contain 'signature_valid' (bool), 'merkle_valid' (bool)
-    """
-    a_sig = 0.6
-    a_merkle = 0.4
-    sig_ok = 1.0 if evidence.get("signature_valid", False) else 0.0
-    merkle_ok = 1.0 if evidence.get("merkle_valid", False) else 0.0
-    return a_sig * sig_ok + a_merkle * merkle_ok
+    # Initialize current trust (T) and bias (B)
+    T: Dict[str, float] = {n: float(initial_trust.get(n, 0.5)) for n in nodes}
+    B: Dict[str, float] = {n: float(initial_trust.get(n, 0.5)) for n in nodes}
 
+    for _ in range(max_iter):
+        T_new: Dict[str, float] = {}
+        delta = 0.0
 
-# --- Semantic consistency computation (stub) ---
-def compute_semantic_consistency(target_id: str, evidence: Dict[str, Any]) -> float:
-    """
-    Placeholder for semantic similarity. Evidence may include 'semantic_similarity' float [0,1]
-    and 'contradiction_penalty' float [0,1].
-    """
-    sim = evidence.get("semantic_similarity", 0.5)
-    penalty = evidence.get("contradiction_penalty", 0.0)
-    value = sim - penalty
-    return max(0.0, min(1.0, value))
+        for v in nodes:
+            incoming_sum = 0.0
 
+            for (u, w_uv, s_uv) in graph.get_incoming(v):
+                outs = graph.get_outgoing(u)
+                Z_u = sum(w for (_, w, _) in outs) if outs else 0.0
+                if Z_u <= 0.0:
+                    continue
 
-# --- Reputation (stub, should link to history) ---
-def get_reputation(store: Dict[str, Any], target_id: str) -> float:
-    """
-    Return reputation from a simple store: store['reputation'][target_id] or baseline 0.5
-    """
-    return float(store.get("reputation", {}).get(target_id, 0.5))
+                out_mul = float(node_out_weight.get(u, 1.0))
+                # contribution from u -> v
+                incoming_sum += (w_uv * s_uv / Z_u) * T.get(u, 0.0) * out_mul
 
+            T_new[v] = alpha * incoming_sum + (1.0 - alpha) * B.get(v, 0.0)
+            delta += abs(T_new[v] - T.get(v, 0.0))
 
-# --- Model confidence (stub: pulled from QPlatform) ---
-def get_model_confidence(store: Dict[str, Any], target_id: str) -> float:
-    """
-    Placeholder: QPlatform may supply a confidence [0,1]
-    """
-    return float(store.get("model_confidence", {}).get(target_id, 0.5))
+        T = T_new
+        if delta < eps:
+            break
 
+    # Clamp to [0,1]
+    for k in list(T.keys()):
+        if T[k] < 0.0:
+            T[k] = 0.0
+        elif T[k] > 1.0:
+            T[k] = 1.0
 
-# --- Decay function ---
-def compute_decay(evidence: Dict[str, Any], gamma: float = 0.001) -> float:
-    """
-    Exponential decay based on age_seconds (provided in evidence).
-    If no age provided, return 1.0.
-    """
-    age = evidence.get("age_seconds", 0)
-    return math.exp(-gamma * age)
-
-
-# --- Audit record creation ---
-def make_audit_record(target_id: str, previous: float, new: float, evidence: Dict[str, Any], meta: Dict[str, Any]) -> Dict[str, Any]:
-    record = {
-        "record_id": str(uuid.uuid4()),
-        "target_id": target_id,
-        "previous_trust": float(previous),
-        "new_trust": float(new),
-        "evidence": evidence,
-        "meta": meta,
-        "timestamp": now_ts()
-    }
-    return record
+    return T
