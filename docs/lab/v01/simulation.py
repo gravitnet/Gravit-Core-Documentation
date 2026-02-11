@@ -1,564 +1,328 @@
-# simulation.py (v0.2 unified)
+# simulation.py
 """
-Gravit Trust Lab — Simulation Engine v0.2
-Adds: Quarantine & Threshold Policy hooks + Recovery ticks
+Gravit Trust Lab — unified simulation v0.2
+------------------------------------------
+Goal: show not only trust drop, but quarantine isolation + recovery.
+
 Depends on:
-  - propagation.py (v0.2: propagate_trust supports node_out_weight)
+  - propagation.py (v0.2 supports node_out_weight in propagate_trust)
   - trust_core.py
-  - audit.py (optional but recommended; used here)
-  - policy.py (new in v0.2)
+  - policy.py
+  - audit.py (optional; if present we write audit records)
 
 Outputs:
-  - simulation_output.jsonl (phases + metrics + state_counts)
-  - audit_log.jsonl (trust updates written via audit.append_audit)
+  - simulation_output.jsonl (metrics per step)
+  - audit_log.jsonl (if audit.py exists & imported)
 """
 
 from __future__ import annotations
 
-import os
 import json
-import time
-import uuid
+import os
 import random
-from typing import Dict, List, Tuple, Any, Optional
+import time
+from dataclasses import dataclass
+from typing import Any, Dict, List, Tuple
 
 import propagation as prop
 import trust_core as core
-import audit as audit_mod
-import policy as pol
+
+# audit is optional
+try:
+    import audit as audit_mod
+except Exception:
+    audit_mod = None  # type: ignore
+
+from policy import ThresholdQuarantinePolicy, PolicyConfig, NodeStatus
+
 
 OUTPUT_FILE = "simulation_output.jsonl"
 
 
-# -------------------------
-# Helpers
-# -------------------------
 def now_ts() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
-def write_output(record: Dict[str, Any]) -> None:
-    line = json.dumps(record, ensure_ascii=False)
-    with open(OUTPUT_FILE, "a", encoding="utf-8") as f:
-        f.write(line + "\n")
+def write_jsonl(path: str, record: Dict[str, Any]) -> None:
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def clamp01(x: float) -> float:
+    return max(0.0, min(1.0, float(x)))
+
+
+@dataclass
+class SimConfig:
+    seed: int = 42
+    node_count: int = 60
+    m_attach: int = 3                 # preferential-attachment edges per new node
+    alpha: float = 0.85               # propagation damping
+    steps: int = 20
+
+    # event probabilities
+    p_good_evidence: float = 0.85     # probability node emits "good" evidence in a step
+    p_attack_event: float = 0.12      # probability an attack-type event happens at a step
+
+    # attack targets
+    attack_target: str = "N1"
+    shock_target: str = "N2"
+    sybil_target: str = "N0"
 
 
 # -------------------------
 # Graph generators
 # -------------------------
-def generate_random_trust_graph(num_nodes: int, avg_deg: float = 2.0, seed: Optional[int] = None) -> prop.TrustGraph:
+def generate_powerlaw_graph(num_nodes: int, m: int, seed: int | None = None) -> prop.TrustGraph:
     if seed is not None:
         random.seed(seed)
     g = prop.TrustGraph()
     nodes = [f"N{i}" for i in range(num_nodes)]
-    for u in nodes:
-        k = max(1, int(random.expovariate(1.0 / avg_deg)))
-        targets = random.sample(nodes, min(k, len(nodes)))
-        for v in targets:
-            if v == u:
-                continue
-            weight = random.uniform(0.5, 1.5)
-            sign = 1.0
-            g.add_edge(u, v, weight=weight, sign=sign)
-    return g
-
-
-def generate_powerlaw_graph(num_nodes: int, m: int = 2, seed: Optional[int] = None) -> prop.TrustGraph:
-    """
-    Simple preferential attachment-ish generator (not strict BA, but good enough for MVP sims).
-    """
-    if seed is not None:
-        random.seed(seed)
-
-    g = prop.TrustGraph()
-    nodes = [f"N{i}" for i in range(num_nodes)]
-
+    # small initial clique
     core_size = min(3, num_nodes)
     for i in range(core_size):
         for j in range(i + 1, core_size):
             g.add_edge(nodes[i], nodes[j], weight=1.0, sign=1.0)
             g.add_edge(nodes[j], nodes[i], weight=1.0, sign=1.0)
 
+    # preferential-ish attachment via random choices among existing
     for i in range(core_size, num_nodes):
-        # prefer earlier nodes
-        targets = random.choices(nodes[:i], k=m)
+        existing = nodes[:i]
+        targets = random.choices(existing, k=m)
         for t in targets:
             if t == nodes[i]:
                 continue
-            g.add_edge(nodes[i], t, weight=1.0, sign=1.0)
-
+            g.add_edge(nodes[i], t, weight=random.uniform(0.7, 1.3), sign=1.0)
+            # occasional back edge
+            if random.random() < 0.35:
+                g.add_edge(t, nodes[i], weight=random.uniform(0.6, 1.1), sign=1.0)
     return g
 
 
-def graph_nodes(graph: prop.TrustGraph) -> List[str]:
-    nodes = set(graph.out.keys())
-    for u, outs in graph.out.items():
+def graph_nodes(g: prop.TrustGraph) -> List[str]:
+    s = set(g.out.keys())
+    for u, outs in g.out.items():
         for (v, _, _) in outs:
-            nodes.add(v)
-    return sorted(nodes)
+            s.add(v)
+    return sorted(s)
 
 
 # -------------------------
-# Baseline trust init
+# Evidence model (simple but effective for “wow demo”)
 # -------------------------
-def baseline_initial_trust(graph: prop.TrustGraph, baseline: float = 0.5) -> Dict[str, float]:
-    return {n: baseline for n in graph_nodes(graph)}
-
-
-def apply_initial_evidence(store: Dict[str, Any], target_id: str, good: bool = True) -> float:
-    """
-    Create an evidence packet and compute/store trust for a node.
-    Writes an audit record via audit_mod.
-    """
-    ev = {
-        "signature_valid": True if good else False,
-        "merkle_valid": True if good else False,
-        "semantic_similarity": random.uniform(0.7, 0.95) if good else random.uniform(0.0, 0.4),
-        "contradiction_penalty": random.uniform(0.0, 0.1) if good else random.uniform(0.2, 0.6),
-        "age_seconds": random.randint(0, 300),
+def make_good_evidence() -> Dict[str, Any]:
+    return {
+        "signature_valid": True,
+        "merkle_valid": True,
+        "semantic_similarity": random.uniform(0.75, 0.95),
+        "contradiction_penalty": random.uniform(0.0, 0.06),
+        "age_seconds": random.randint(0, 180),
     }
 
-    prev = store.get("trust_state", {}).get(target_id, 0.5)
 
-    p = core.compute_provenance(ev)
-    s = core.compute_semantic_consistency(target_id, ev)
-    r = core.get_reputation(store, target_id)
-    m = core.get_model_confidence(store, target_id)
-    decay = core.compute_decay(ev)
+def make_bad_evidence() -> Dict[str, Any]:
+    return {
+        "signature_valid": False,
+        "merkle_valid": False,
+        "semantic_similarity": random.uniform(0.0, 0.35),
+        "contradiction_penalty": random.uniform(0.25, 0.70),
+        "age_seconds": random.randint(0, 10),
+    }
 
-    weights = {"p": 0.25, "s": 0.35, "r": 0.2, "m": 0.2}
+
+def compute_local_trust(store: Dict[str, Any], node_id: str, evidence: Dict[str, Any]) -> float:
+    prev = float(store["trust_state"].get(node_id, 0.5))
+
+    p = core.compute_provenance(evidence)
+    s = core.compute_semantic_consistency(node_id, evidence)
+    r = core.get_reputation(store, node_id)
+    m = core.get_model_confidence(store, node_id)
+    decay = core.compute_decay(evidence)
+
+    # You can tune weights later; keep interpretable for v0.2 demo
+    weights = evidence.get("weights", {"p": 0.25, "s": 0.35, "r": 0.20, "m": 0.20})
     new_score = core.compute_trust_linear(p, s, r, m, decay, weights)
 
-    store.setdefault("trust_state", {})[target_id] = new_score
-    audit = core.make_audit_record(
-        target_id=target_id,
-        previous=prev,
-        new=new_score,
-        evidence=ev,
-        meta={"source": "simulation_initial"},
-    )
-    audit_mod.append_audit(audit)
-    return new_score
+    # audit (optional)
+    if audit_mod is not None:
+        rec = core.make_audit_record(node_id, prev, new_score, evidence, {"source": "simulation_v0.2", "weights": weights})
+        audit_mod.append_audit(rec)
+
+    store["trust_state"][node_id] = float(new_score)
+    return float(new_score)
 
 
 # -------------------------
-# Policy helpers (v0.2)
+# Attacks (lightweight, but demonstrative)
 # -------------------------
-def build_out_weight_map(policy_states: Dict[str, pol.NodePolicyState]) -> Dict[str, float]:
-    return {nid: ps.out_weight for nid, ps in policy_states.items()}
-
-
-def collect_state_counts(policy_states: Dict[str, pol.NodePolicyState]) -> Dict[str, int]:
-    counts = {"NORMAL": 0, "WARNING": 0, "QUARANTINED": 0, "RECOVERING": 0}
-    for ps in policy_states.values():
-        counts[ps.state] = counts.get(ps.state, 0) + 1
-    return counts
-
-
-def propagate_with_policy(
-    graph: prop.TrustGraph,
-    store: Dict[str, Any],
-    policy_states: Dict[str, pol.NodePolicyState],
-    thresholds: Dict[str, float],
-    policy_cfg: Dict[str, float],
-    alpha: float = 0.85,
-) -> Dict[str, pol.NodePolicyState]:
-    """
-    One policy-aware propagation step:
-      policy_step -> propagate (with node_out_weight) -> policy_step
-    """
-    # pre-policy update
-    policy_states = pol.policy_step(policy_states, store["trust_state"], thresholds, policy_cfg)
-
-    # propagate with quarantine/recovery effect
-    out_w = build_out_weight_map(policy_states)
-    T = prop.propagate_trust(graph, store["trust_state"], alpha=alpha, node_out_weight=out_w)
-    store["trust_state"].update(T)
-
-    # post-policy update
-    policy_states = pol.policy_step(policy_states, store["trust_state"], thresholds, policy_cfg)
-    return policy_states
-
-
-def run_recovery_ticks(
-    graph: prop.TrustGraph,
-    store: Dict[str, Any],
-    policy_states: Dict[str, pol.NodePolicyState],
-    thresholds: Dict[str, float],
-    policy_cfg: Dict[str, float],
-    ticks: int = 5,
-    alpha: float = 0.85,
-) -> Dict[str, pol.NodePolicyState]:
-    for _ in range(ticks):
-        policy_states = propagate_with_policy(graph, store, policy_states, thresholds, policy_cfg, alpha=alpha)
-    return policy_states
-
-
-# -------------------------
-# Attack Scenarios
-# -------------------------
-def scenario_sybil_injection(
-    graph: prop.TrustGraph,
-    store: Dict[str, Any],
-    n_sybil: int = 20,
-    connect_to: str = "N0",
-    seed: Optional[int] = None,
-) -> List[str]:
-    """
-    Create sybil nodes that connect strongly to a target and to each other.
-    """
-    if seed is not None:
-        random.seed(seed)
-
+def apply_sybil_injection(g: prop.TrustGraph, store: Dict[str, Any], target: str, n_sybil: int = 20) -> List[str]:
     sybils = [f"SYB{i}" for i in range(n_sybil)]
     for s in sybils:
-        # strong support edge to target
-        graph.add_edge(s, connect_to, weight=1.0, sign=1.0)
-
-        # interconnect sybils (dense-ish clique)
+        # sybil links toward target
+        g.add_edge(s, target, weight=1.2, sign=1.0)
+        # some sybil clique
         for t in sybils:
-            if t == s:
-                continue
-            if random.random() < 0.6:
-                graph.add_edge(s, t, weight=random.uniform(0.6, 1.2), sign=1.0)
-
-        # simulate "bought" trust baseline (will be constrained by policy later if needed)
-        store.setdefault("trust_state", {})[s] = random.uniform(0.7, 0.95)
-
-    write_output(
-        {
-            "scenario": "sybil_injection",
-            "target": connect_to,
-            "sybil_count": n_sybil,
-            "timestamp": now_ts(),
-        }
-    )
+            if t != s and random.random() < 0.5:
+                g.add_edge(s, t, weight=random.uniform(0.7, 1.2), sign=1.0)
+        # artificially elevated start trust (simulating “bought reputation”)
+        store["trust_state"][s] = random.uniform(0.70, 0.93)
+        store["reputation"][s] = random.uniform(0.55, 0.85)
+        store["model_confidence"][s] = random.uniform(0.50, 0.80)
     return sybils
 
 
-def scenario_contradiction_flood(
-    graph: prop.TrustGraph,
-    store: Dict[str, Any],
-    target: str,
-    n_attackers: int = 10,
-    seed: Optional[int] = None,
-) -> List[str]:
-    """
-    Add negative-sign edges into target from random attackers.
-    """
-    if seed is not None:
-        random.seed(seed)
-
-    pool = graph_nodes(graph)
-    attackers = random.sample(pool, min(len(pool), n_attackers))
-    for a in attackers:
-        if a == target:
-            continue
-        graph.add_edge(a, target, weight=random.uniform(0.8, 1.2), sign=-1.0)
-        store.setdefault("trust_state", {})[a] = random.uniform(0.4, 0.9)
-
-    write_output(
-        {
-            "scenario": "contradiction_flood",
-            "target": target,
-            "attackers": attackers,
-            "timestamp": now_ts(),
-        }
-    )
-    return attackers
+def apply_contradiction_flood(g: prop.TrustGraph, store: Dict[str, Any], target: str, attackers: int = 10) -> List[str]:
+    nodes = list(store["trust_state"].keys())
+    pool = [n for n in nodes if not n.startswith("SYB")]
+    chosen = random.sample(pool, k=min(len(pool), attackers))
+    for a in chosen:
+        g.add_edge(a, target, weight=random.uniform(0.9, 1.3), sign=-1.0)
+        # make attackers credible enough to matter
+        store["trust_state"][a] = max(store["trust_state"].get(a, 0.5), random.uniform(0.55, 0.85))
+    return chosen
 
 
-def scenario_rapid_trust_drop(store: Dict[str, Any], target: str) -> float:
-    """
-    Simulate sudden provenance failure (key compromise).
-    Writes audit record.
-    """
-    prev = store.get("trust_state", {}).get(target, 0.5)
-    ev = {
-        "signature_valid": False,
-        "merkle_valid": False,
-        "semantic_similarity": random.uniform(0.0, 0.3),
-        "contradiction_penalty": random.uniform(0.2, 0.7),
-        "age_seconds": 1,
-    }
-
-    p = core.compute_provenance(ev)
-    s = core.compute_semantic_consistency(target, ev)
-    r = core.get_reputation(store, target)
-    m = core.get_model_confidence(store, target)
-    decay = core.compute_decay(ev)
-
-    # heavier weight on provenance in this shock scenario
-    weights = {"p": 0.4, "s": 0.3, "r": 0.15, "m": 0.15}
-    new_score = core.compute_trust_linear(p, s, r, m, decay, weights)
-
-    store.setdefault("trust_state", {})[target] = new_score
-
-    audit = core.make_audit_record(
-        target_id=target,
-        previous=prev,
-        new=new_score,
-        evidence=ev,
-        meta={"scenario": "rapid_trust_drop", "weights": weights},
-    )
-    audit_mod.append_audit(audit)
-
-    write_output(
-        {
-            "scenario": "rapid_trust_drop",
-            "target": target,
-            "prev": prev,
-            "new": new_score,
-            "timestamp": now_ts(),
-        }
-    )
-    return new_score
+def apply_rapid_trust_drop(store: Dict[str, Any], target: str) -> float:
+    ev = make_bad_evidence()
+    # emphasize provenance in rapid drop
+    ev["weights"] = {"p": 0.45, "s": 0.30, "r": 0.15, "m": 0.10}
+    return compute_local_trust(store, target, ev)
 
 
 # -------------------------
 # Metrics
 # -------------------------
-def collect_metrics(store: Dict[str, Any], nodes: Optional[List[str]] = None) -> Dict[str, float]:
-    if nodes is None:
-        nodes = list(store.get("trust_state", {}).keys())
+def count_by_status(policy: ThresholdQuarantinePolicy) -> Dict[str, int]:
+    out: Dict[str, int] = {s.value: 0 for s in NodeStatus}
+    for st in policy.status.values():
+        out[st.value] = out.get(st.value, 0) + 1
+    return out
 
-    trusts = [float(store.get("trust_state", {}).get(n, 0.5)) for n in nodes]
+
+def compute_metrics(store: Dict[str, Any], policy: ThresholdQuarantinePolicy) -> Dict[str, Any]:
+    trusts = list(store["trust_state"].values())
     if not trusts:
-        return {
-            "node_count": 0,
-            "avg_trust": 0.0,
-            "min_trust": 0.0,
-            "max_trust": 0.0,
-            "stddev_trust": 0.0,
-        }
-
+        return {"avg": 0.0, "min": 0.0, "max": 0.0, "std": 0.0}
     avg = sum(trusts) / len(trusts)
+    mn = min(trusts)
+    mx = max(trusts)
     var = sum((x - avg) ** 2 for x in trusts) / len(trusts)
     return {
         "node_count": len(trusts),
-        "avg_trust": avg,
-        "min_trust": min(trusts),
-        "max_trust": max(trusts),
-        "stddev_trust": var ** 0.5,
+        "avg_trust": round(avg, 6),
+        "min_trust": round(mn, 6),
+        "max_trust": round(mx, 6),
+        "stddev_trust": round(var ** 0.5, 6),
+        "status_counts": count_by_status(policy),
     }
 
 
 # -------------------------
-# Runner
+# Main simulation loop (v0.2)
 # -------------------------
-def run_full_simulation(
-    seed: int = 42,
-    scenario_sequence: Optional[List[Tuple[str, Dict[str, Any]]]] = None,
-    verbose: bool = True,
-    graph_type: str = "powerlaw",
-    node_count: int = 50,
-    alpha: float = 0.85,
-    recovery_ticks: int = 5,
-) -> Dict[str, Any]:
-    """
-    scenario_sequence: list of (scenario_name, params)
-      supported: "sybil_injection", "contradiction_flood", "rapid_trust_drop"
-    """
-    random.seed(seed)
+def run_simulation(cfg: SimConfig | None = None, policy_cfg: PolicyConfig | None = None) -> Dict[str, Any]:
+    cfg = cfg or SimConfig()
+    random.seed(cfg.seed)
 
-    # (re)create outputs
+    # fresh outputs
     if os.path.exists(OUTPUT_FILE):
         os.remove(OUTPUT_FILE)
 
-    # graph
-    if graph_type == "random":
-        graph = generate_random_trust_graph(node_count, avg_deg=2.0, seed=seed)
-    else:
-        graph = generate_powerlaw_graph(node_count, m=3, seed=seed)
+    # init
+    g = generate_powerlaw_graph(cfg.node_count, cfg.m_attach, seed=cfg.seed)
+    nodes = graph_nodes(g)
 
-    nodes = graph_nodes(graph)
+    store: Dict[str, Any] = {
+        "reputation": {},
+        "model_confidence": {},
+        "trust_state": {},
+    }
 
-    # store
-    store: Dict[str, Any] = {"reputation": {}, "model_confidence": {}, "trust_state": {}}
-
-    # init reputations + model confidence
+    # baseline reputation & model confidence
     for n in nodes:
-        store["reputation"][n] = random.uniform(0.3, 0.9)
-        store["model_confidence"][n] = random.uniform(0.4, 0.95)
+        store["reputation"][n] = random.uniform(0.35, 0.90)
+        store["model_confidence"][n] = random.uniform(0.40, 0.95)
+        store["trust_state"][n] = 0.5
 
-    # initial evidence for some nodes
-    for n in nodes[:10]:
-        apply_initial_evidence(store, n, good=True)
+    policy = ThresholdQuarantinePolicy(policy_cfg or PolicyConfig())
+    for n in list(store["trust_state"].keys()):
+        policy.ensure_node(n, initial_trust=store["trust_state"][n])
 
-    # baseline fill
-    baseline = baseline_initial_trust(graph, baseline=0.5)
-    for k, v in baseline.items():
-        store["trust_state"].setdefault(k, v)
+    # STEP 0: warm-up propagation
+    node_out_weight = {n: policy.node_out_weight(n) for n in store["trust_state"].keys()}
+    T = prop.propagate_trust(g, store["trust_state"], node_out_weight=node_out_weight, alpha=cfg.alpha)
+    store["trust_state"].update(T)
+    for n in list(store["trust_state"].keys()):
+        policy.step_update(n, store["trust_state"][n])
 
-    # policy state + configs
-    policy_states: Dict[str, pol.NodePolicyState] = {}
-    thresholds = pol.DEFAULT_THRESHOLDS.copy()
-    policy_cfg = pol.DEFAULT_POLICY.copy()
+    write_jsonl(OUTPUT_FILE, {
+        "ts": now_ts(),
+        "step": 0,
+        "phase": "warmup",
+        "metrics": compute_metrics(store, policy),
+    })
 
-    # initial policy-aware propagation
-    policy_states = propagate_with_policy(graph, store, policy_states, thresholds, policy_cfg, alpha=alpha)
-    write_output(
-        {
-            "phase": "initial_propagation",
-            "graph_type": graph_type,
-            "node_count": node_count,
-            "alpha": alpha,
-            "metrics": collect_metrics(store, nodes),
-            "state_counts": collect_state_counts(policy_states),
-            "timestamp": now_ts(),
+    # MAIN LOOP
+    for step in range(1, cfg.steps + 1):
+        events: List[Dict[str, Any]] = []
+
+        # 1) local evidence updates (per node)
+        for n in list(store["trust_state"].keys()):
+            good = (random.random() < cfg.p_good_evidence)
+            ev = make_good_evidence() if good else make_bad_evidence()
+            new_local = compute_local_trust(store, n, ev)
+            new_status = policy.step_update(n, new_local)
+            events.append({"node": n, "kind": "evidence", "good": good, "trust": round(new_local, 6), "status": new_status.value})
+
+        # 2) occasional attacks (to trigger quarantine/recovery dynamics)
+        attack_happened = False
+        if random.random() < cfg.p_attack_event:
+            attack_happened = True
+            # rotate attack types to show different "wow" behaviors
+            if step % 3 == 1:
+                sybils = apply_sybil_injection(g, store, target=cfg.sybil_target, n_sybil=18)
+                for s in sybils:
+                    policy.ensure_node(s, initial_trust=store["trust_state"][s])
+                events.append({"kind": "attack", "type": "sybil_injection", "target": cfg.sybil_target, "count": len(sybils)})
+            elif step % 3 == 2:
+                attackers = apply_contradiction_flood(g, store, target=cfg.attack_target, attackers=10)
+                events.append({"kind": "attack", "type": "contradiction_flood", "target": cfg.attack_target, "attackers": attackers})
+            else:
+                new_score = apply_rapid_trust_drop(store, target=cfg.shock_target)
+                # policy update (rapid drop should quarantine)
+                policy.step_update(cfg.shock_target, new_score)
+                events.append({"kind": "attack", "type": "rapid_trust_drop", "target": cfg.shock_target, "new_trust": round(new_score, 6)})
+
+        # 3) propagation with policy-aware node_out_weight
+        node_out_weight = {n: policy.node_out_weight(n) for n in store["trust_state"].keys()}
+        T = prop.propagate_trust(g, store["trust_state"], node_out_weight=node_out_weight, alpha=cfg.alpha)
+        store["trust_state"].update(T)
+
+        # 4) apply policy after propagation (so quarantine affects next step influence)
+        for n in list(store["trust_state"].keys()):
+            policy.step_update(n, store["trust_state"][n])
+
+        rec = {
+            "ts": now_ts(),
+            "step": step,
+            "phase": "main",
+            "attack_happened": attack_happened,
+            "metrics": compute_metrics(store, policy),
+            # keep events compact; can be turned off if too big
+            "events_sample": events[:20],
         }
-    )
-
-    if scenario_sequence is None:
-        scenario_sequence = [
-            ("sybil_injection", {"n_sybil": 20, "connect_to": "N0"}),
-            ("contradiction_flood", {"target": "N1", "n_attackers": 8}),
-            ("rapid_trust_drop", {"target": "N2"}),
-        ]
-
-    # run scenarios
-    for sn, params in scenario_sequence:
-        if sn == "sybil_injection":
-            sybils = scenario_sybil_injection(
-                graph,
-                store,
-                n_sybil=int(params.get("n_sybil", 20)),
-                connect_to=str(params.get("connect_to", "N0")),
-                seed=params.get("seed"),
-            )
-
-            policy_states = propagate_with_policy(graph, store, policy_states, thresholds, policy_cfg, alpha=alpha)
-
-            rec = {
-                "phase": "after_sybil",
-                "sybil_count": len(sybils),
-                "target": params.get("connect_to", "N0"),
-                "metrics": collect_metrics(store, nodes + sybils),
-                "state_counts": collect_state_counts(policy_states),
-                "timestamp": now_ts(),
-            }
-            write_output(rec)
-            if verbose:
-                print("After sybil:", rec)
-
-            # recovery ticks
-            policy_states = run_recovery_ticks(
-                graph, store, policy_states, thresholds, policy_cfg, ticks=recovery_ticks, alpha=alpha
-            )
-            rec2 = {
-                "phase": "recovery_after_sybil",
-                "ticks": recovery_ticks,
-                "metrics": collect_metrics(store, nodes + sybils),
-                "state_counts": collect_state_counts(policy_states),
-                "timestamp": now_ts(),
-            }
-            write_output(rec2)
-            if verbose:
-                print("Recovery after sybil:", rec2)
-
-        elif sn == "contradiction_flood":
-            target = str(params.get("target", "N1"))
-            attackers = scenario_contradiction_flood(
-                graph,
-                store,
-                target=target,
-                n_attackers=int(params.get("n_attackers", 8)),
-                seed=params.get("seed"),
-            )
-
-            policy_states = propagate_with_policy(graph, store, policy_states, thresholds, policy_cfg, alpha=alpha)
-
-            rec = {
-                "phase": "after_contradiction",
-                "target": target,
-                "attackers": attackers,
-                "metrics": collect_metrics(store, nodes),
-                "state_counts": collect_state_counts(policy_states),
-                "timestamp": now_ts(),
-            }
-            write_output(rec)
-            if verbose:
-                print("After contradiction flood:", rec)
-
-            policy_states = run_recovery_ticks(
-                graph, store, policy_states, thresholds, policy_cfg, ticks=recovery_ticks, alpha=alpha
-            )
-            rec2 = {
-                "phase": "recovery_after_contradiction",
-                "ticks": recovery_ticks,
-                "metrics": collect_metrics(store, nodes),
-                "state_counts": collect_state_counts(policy_states),
-                "timestamp": now_ts(),
-            }
-            write_output(rec2)
-            if verbose:
-                print("Recovery after contradiction:", rec2)
-
-        elif sn == "rapid_trust_drop":
-            target = str(params.get("target", "N2"))
-            newscore = scenario_rapid_trust_drop(store, target)
-
-            policy_states = propagate_with_policy(graph, store, policy_states, thresholds, policy_cfg, alpha=alpha)
-
-            rec = {
-                "phase": "after_rapid_drop",
-                "target": target,
-                "newscore": float(newscore),
-                "metrics": collect_metrics(store, nodes),
-                "state_counts": collect_state_counts(policy_states),
-                "timestamp": now_ts(),
-            }
-            write_output(rec)
-            if verbose:
-                print("After rapid drop:", rec)
-
-            policy_states = run_recovery_ticks(
-                graph, store, policy_states, thresholds, policy_cfg, ticks=recovery_ticks, alpha=alpha
-            )
-            rec2 = {
-                "phase": "recovery_after_rapid_drop",
-                "ticks": recovery_ticks,
-                "metrics": collect_metrics(store, nodes),
-                "state_counts": collect_state_counts(policy_states),
-                "timestamp": now_ts(),
-            }
-            write_output(rec2)
-            if verbose:
-                print("Recovery after rapid drop:", rec2)
-
-        else:
-            if verbose:
-                print("Unknown scenario:", sn)
-
-    final_metrics = collect_metrics(store, nodes)
-    final_state_counts = collect_state_counts(policy_states)
-    write_output(
-        {
-            "phase": "final_snapshot",
-            "metrics": final_metrics,
-            "state_counts": final_state_counts,
-            "timestamp": now_ts(),
-        }
-    )
-    if verbose:
-        print("Final metrics:", final_metrics)
-        print("Final state_counts:", final_state_counts)
+        write_jsonl(OUTPUT_FILE, rec)
 
     return {
-        "graph": graph,
-        "store": store,
-        "metrics": final_metrics,
-        "policy_states": policy_states,
+        "output_file": OUTPUT_FILE,
+        "final_metrics": compute_metrics(store, policy),
+        "status_snapshot": policy.export_status_snapshot(),
+        "node_count": len(store["trust_state"]),
     }
 
 
-# -------------------------
-# CLI
-# -------------------------
 if __name__ == "__main__":
-    # optional: clear audit to make runs easier to read (comment out if you want cumulative audit)
-    # if os.path.exists("audit_log.jsonl"):
-    #     os.remove("audit_log.jsonl")
-
-    run_full_simulation(seed=42, verbose=True, graph_type="powerlaw", node_count=50, alpha=0.85, recovery_ticks=5)
-    print("Simulation complete. See:", OUTPUT_FILE)
+    result = run_simulation()
+    print("Simulation finished.")
+    print("Output:", result["output_file"])
+    print("Final metrics:", result["final_metrics"])

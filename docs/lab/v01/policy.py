@@ -1,122 +1,128 @@
 # policy.py
 from __future__ import annotations
-from dataclasses import dataclass, field
+
+from dataclasses import dataclass
+from enum import Enum
 from typing import Dict
 
 
-DEFAULT_THRESHOLDS = {
-    "accept": 0.85,
-    "warn": 0.60,
-    "quarantine": 0.30,
-    "recover": 0.55,
-}
-
-DEFAULT_POLICY = {
-    "min_stable_steps": 3,          # сколько шагов доверие должно быть стабильным для recovery
-    "max_trust_step_delta": 0.05,   # "стабильность" = изменение доверия меньше этого
-    "quarantine_out_weight": 0.0,   # влияние карантинного узла наружу
-    "recovering_out_weight": 0.2,   # влияние recovering узла наружу
-    "warning_out_weight": 0.7,      # optional: смягчаем влияние warning
-    "normal_out_weight": 1.0,
-    "incoming_quarantine_weight": 0.3,  # optional: входящие влияния в quarantine
-}
+class NodeStatus(str, Enum):
+    NORMAL = "NORMAL"
+    WARNING = "WARNING"
+    QUARANTINED = "QUARANTINED"
+    RECOVERING = "RECOVERING"
 
 
 @dataclass
-class NodePolicyState:
-    node_id: str
-    state: str = "NORMAL"  # NORMAL | WARNING | QUARANTINED | RECOVERING
-    stable_steps: int = 0
-    last_trust: float = 0.5
-    out_weight: float = 1.0
-    incoming_weight: float = 1.0
+class PolicyConfig:
+    # Thresholds
+    warning_threshold: float = 0.65
+    quarantine_threshold: float = 0.25
+    recover_enter_threshold: float = 0.35
+    normal_enter_threshold: float = 0.70
+
+    # Dynamics
+    rapid_drop_delta: float = 0.25          # if trust drops by >= this per step → quarantine trigger
+    quarantine_min_steps: int = 3           # minimum time spent in quarantine before recovery allowed
+    recovery_min_steps: int = 4             # minimum time spent recovering before NORMAL allowed
+
+    # Influence multipliers (used by propagation node_out_weight)
+    out_weight_normal: float = 1.0
+    out_weight_warning: float = 0.6
+    out_weight_quarantined: float = 0.0
+    out_weight_recovering: float = 0.2
 
 
-def evaluate_state(trust: float, prev_state: str, thresholds: Dict[str, float]) -> str:
-    if trust < thresholds["quarantine"]:
-        return "QUARANTINED"
-    if trust < thresholds["warn"]:
-        # WARNING — если не карантин
-        return "WARNING"
-    # RECOVERING мы не сбрасываем автоматически, только через try_recover→NORMAL
-    if trust >= thresholds["accept"] and prev_state in ("NORMAL", "WARNING"):
-        return "NORMAL"
-    return prev_state
-
-
-def apply_state_effects(ps: NodePolicyState, policy: Dict[str, float]) -> None:
-    if ps.state == "QUARANTINED":
-        ps.out_weight = policy["quarantine_out_weight"]
-        ps.incoming_weight = policy["incoming_quarantine_weight"]
-    elif ps.state == "RECOVERING":
-        ps.out_weight = policy["recovering_out_weight"]
-        ps.incoming_weight = 1.0
-    elif ps.state == "WARNING":
-        ps.out_weight = policy["warning_out_weight"]
-        ps.incoming_weight = 1.0
-    else:  # NORMAL
-        ps.out_weight = policy["normal_out_weight"]
-        ps.incoming_weight = 1.0
-
-
-def update_stability(ps: NodePolicyState, current_trust: float, policy: Dict[str, float]) -> None:
-    # стабильность = доверие не скачет
-    if abs(current_trust - ps.last_trust) <= policy["max_trust_step_delta"]:
-        ps.stable_steps += 1
-    else:
-        ps.stable_steps = 0
-    ps.last_trust = current_trust
-
-
-def try_recover(ps: NodePolicyState, current_trust: float, thresholds: Dict[str, float], policy: Dict[str, float]) -> None:
+class ThresholdQuarantinePolicy:
     """
-    Логика восстановления:
-    QUARANTINED -> RECOVERING, если trust > recover и стабильность накоплена.
-    RECOVERING -> NORMAL, если trust >= warn (или accept) и стабильность накоплена.
+    Minimal policy engine:
+      - decides node status transitions based on trust score dynamics
+      - exposes node_out_weight multipliers for propagation engine
     """
-    min_steps = int(policy["min_stable_steps"])
 
-    if ps.state == "QUARANTINED":
-        if current_trust > thresholds["recover"] and ps.stable_steps >= min_steps:
-            ps.state = "RECOVERING"
-            ps.stable_steps = 0  # перезапуск стабильности для следующего шага
-            apply_state_effects(ps, policy)
+    def __init__(self, cfg: PolicyConfig | None = None):
+        self.cfg = cfg or PolicyConfig()
 
-    elif ps.state == "RECOVERING":
-        # условие возврата: выбрались из warn-зоны и стабильны
-        if current_trust >= thresholds["warn"] and ps.stable_steps >= min_steps:
-            ps.state = "NORMAL"
-            ps.stable_steps = 0
-            apply_state_effects(ps, policy)
+        # per-node state
+        self.status: Dict[str, NodeStatus] = {}
+        self.quarantine_age: Dict[str, int] = {}
+        self.recovery_age: Dict[str, int] = {}
+        self.last_trust: Dict[str, float] = {}
 
+    def ensure_node(self, node_id: str, initial_trust: float = 0.5) -> None:
+        if node_id not in self.status:
+            self.status[node_id] = NodeStatus.NORMAL
+            self.quarantine_age[node_id] = 0
+            self.recovery_age[node_id] = 0
+            self.last_trust[node_id] = float(initial_trust)
 
-def policy_step(
-    policy_states: Dict[str, NodePolicyState],
-    trust_state: Dict[str, float],
-    thresholds: Dict[str, float] | None = None,
-    policy: Dict[str, float] | None = None,
-) -> Dict[str, NodePolicyState]:
-    thresholds = thresholds or DEFAULT_THRESHOLDS
-    policy = policy or DEFAULT_POLICY
+    def node_out_weight(self, node_id: str) -> float:
+        st = self.status.get(node_id, NodeStatus.NORMAL)
+        if st == NodeStatus.NORMAL:
+            return self.cfg.out_weight_normal
+        if st == NodeStatus.WARNING:
+            return self.cfg.out_weight_warning
+        if st == NodeStatus.QUARANTINED:
+            return self.cfg.out_weight_quarantined
+        if st == NodeStatus.RECOVERING:
+            return self.cfg.out_weight_recovering
+        return 1.0
 
-    # ensure policy_state exists per node
-    for node_id, t in trust_state.items():
-        if node_id not in policy_states:
-            ps = NodePolicyState(node_id=node_id, last_trust=t)
-            apply_state_effects(ps, policy)
-            policy_states[node_id] = ps
+    def step_update(self, node_id: str, new_trust: float) -> NodeStatus:
+        """
+        Apply one policy step for node based on trust and delta vs previous.
+        Returns updated status.
+        """
+        self.ensure_node(node_id, initial_trust=new_trust)
 
-    # update stability + state
-    for node_id, t in trust_state.items():
-        ps = policy_states[node_id]
-        update_stability(ps, t, policy)
-        new_state = evaluate_state(t, ps.state, thresholds)
-        if new_state != ps.state:
-            ps.state = new_state
-            ps.stable_steps = 0
-            apply_state_effects(ps, policy)
+        prev = self.last_trust.get(node_id, 0.5)
+        delta_drop = max(0.0, prev - float(new_trust))
 
-        # try recovery transitions (only after stability update)
-        try_recover(ps, t, thresholds, policy)
+        st = self.status[node_id]
 
-    return policy_states
+        # track ages
+        if st == NodeStatus.QUARANTINED:
+            self.quarantine_age[node_id] += 1
+        else:
+            self.quarantine_age[node_id] = 0
+
+        if st == NodeStatus.RECOVERING:
+            self.recovery_age[node_id] += 1
+        else:
+            self.recovery_age[node_id] = 0
+
+        # hard triggers into quarantine
+        if float(new_trust) <= self.cfg.quarantine_threshold or delta_drop >= self.cfg.rapid_drop_delta:
+            self.status[node_id] = NodeStatus.QUARANTINED
+            self.last_trust[node_id] = float(new_trust)
+            return self.status[node_id]
+
+        # transitions out of quarantine
+        if st == NodeStatus.QUARANTINED:
+            # only after minimum quarantine time and trust above recover_enter_threshold
+            if self.quarantine_age[node_id] >= self.cfg.quarantine_min_steps and float(new_trust) >= self.cfg.recover_enter_threshold:
+                self.status[node_id] = NodeStatus.RECOVERING
+                self.last_trust[node_id] = float(new_trust)
+                return self.status[node_id]
+            else:
+                self.last_trust[node_id] = float(new_trust)
+                return self.status[node_id]
+
+        # transitions within non-quarantine states
+        if float(new_trust) < self.cfg.warning_threshold:
+            self.status[node_id] = NodeStatus.WARNING
+        else:
+            self.status[node_id] = NodeStatus.NORMAL
+
+        # exit from recovering to normal (stable & sufficient trust + time)
+        if st == NodeStatus.RECOVERING:
+            if (self.recovery_age[node_id] >= self.cfg.recovery_min_steps) and (float(new_trust) >= self.cfg.normal_enter_threshold):
+                self.status[node_id] = NodeStatus.NORMAL
+            else:
+                self.status[node_id] = NodeStatus.RECOVERING
+
+        self.last_trust[node_id] = float(new_trust)
+        return self.status[node_id]
+
+    def export_status_snapshot(self) -> Dict[str, str]:
+        return {k: v.value for k, v in self.status.items()}
